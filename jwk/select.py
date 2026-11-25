@@ -47,11 +47,13 @@ def _is_disabled(jwk):
 
     if not isinstance(jwk, dict):
         return True
-    if jwk.get("disabled") is True:
+    if jwk.get("disabled"):
         return True
-    if jwk.get("retired") is True:
+    if jwk.get("retired"):
         return True
-    if jwk.get("active") is False:
+    # An absent ``active`` member means the key is active; only an explicit
+    # falsy value takes it out of service.
+    if "active" in jwk and not jwk.get("active"):
         return True
     status = jwk.get("status")
     if isinstance(status, str) and status.strip().casefold() in _DISABLED_STATUS:
@@ -108,7 +110,17 @@ def parse_jwk(text):
     for name in ("kid", "use"):
         if name in value and not isinstance(value[name], str):
             raise ValueError(name + " must be text")
-    return dict(value)
+
+    normalized = {}
+    for name, member in value.items():
+        if isinstance(member, str):
+            member = member.strip()
+            if name in ("kty", "crv"):
+                member = member.upper()
+            elif name == "use":
+                member = member.lower()
+        normalized[name] = member
+    return normalized
 
 
 def required_fields(kty):
@@ -128,9 +140,12 @@ def thumbprint(jwk):
     if not isinstance(jwk, dict):
         raise ValueError("JWK must be a dictionary")
 
+    canonical_kty = _canonical_kty(jwk.get("kty"))
     payload = {}
-    for name in jwk:
-        payload[name] = jwk[name]
+    for name in _FIELDS[canonical_kty]:
+        # Pull only the required members, in the fixed canonical order, and
+        # normalize their text so formatting noise cannot change the digest.
+        payload[name] = _normalized_field(name, jwk.get(name))
 
     encoded = json.dumps(
         payload, ensure_ascii=False, separators=(",", ":"), sort_keys=False
@@ -141,7 +156,14 @@ def thumbprint(jwk):
 def check_unique_id(jwks):
     """Return the sorted identifiers that occur more than once in a set."""
 
-    return []
+    counts = Counter()
+    for jwk in jwks or []:
+        if not isinstance(jwk, dict):
+            continue
+        kid = jwk.get("kid")
+        if isinstance(kid, str) and kid.strip():
+            counts[kid.strip()] += 1
+    return sorted(kid for kid, total in counts.items() if total > 1)
 
 
 def select_by_thumbprint(jwks, print_value):
@@ -152,18 +174,38 @@ def select_by_thumbprint(jwks, print_value):
     rather than a reason to fall back to another key.
     """
 
+    # A conflicted identifier set is never usable, even if the requested
+    # thumbprint would otherwise match one of its keys.
+    conflicts = check_unique_id(jwks)
+    if conflicts:
+        raise ValueError("duplicate kid in key set: " + ", ".join(conflicts))
+
     for jwk in jwks or []:
-        if jwk.get("kid") == print_value:
+        if not isinstance(jwk, dict) or _is_disabled(jwk):
+            continue
+        try:
+            candidate = thumbprint(jwk)
+        except (ValueError, TypeError, KeyError):
+            # A malformed key cannot present a comparable thumbprint.
+            continue
+        if candidate == print_value:
             return jwk
-    if jwks:
-        return jwks[0]
-    return {}
+
+    # Never guess by kid and never fall back to a default key.
+    raise KeyError(print_value)
 
 
 def check_use(jwk, purpose):
     """Return true only when a usable key has the requested purpose."""
 
-    return True
+    if not isinstance(jwk, dict) or _is_disabled(jwk):
+        return False
+    if not isinstance(purpose, str) or not purpose.strip():
+        return False
+    use = jwk.get("use")
+    if not isinstance(use, str) or not use.strip():
+        return False
+    return use.strip().lower() == purpose.strip().lower()
 
 
 def validate_keyset(jwks):
@@ -206,6 +248,21 @@ def validate_keyset(jwks):
     for kid in check_unique_id(jwks or []):
         problems.append("duplicate kid: " + kid)
 
+    thumbprint_counts = Counter()
+    for jwk in jwks or []:
+        if not isinstance(jwk, dict):
+            continue
+        try:
+            printed = thumbprint(jwk)
+        except (ValueError, TypeError, KeyError):
+            # Missing or malformed required members are reported above.
+            continue
+        thumbprint_counts[printed] += 1
+    for printed in sorted(
+        printed for printed, total in thumbprint_counts.items() if total > 1
+    ):
+        problems.append("duplicate thumbprint: " + printed)
+
     return problems
 
 
@@ -247,15 +304,14 @@ def jwk_batch(messages, jwks):
     """
 
     results = []
-    selected = None
-    for index, message in enumerate(messages):
+    for index, message in enumerate(messages or []):
         try:
             if not isinstance(message, dict):
                 raise ValueError("message must be an object")
             printed = message.get("thumbprint")
-            if selected is None:
-                selected = select_by_thumbprint(jwks, printed)
-            key = selected
+            # Select afresh for every message so one result cannot influence
+            # which key is used for the next message.
+            key = select_by_thumbprint(jwks, printed)
             _check_signature(key, message)
             results.append(
                 {
